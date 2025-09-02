@@ -20,7 +20,7 @@ use crate::{
     morph_sim::{preset_path_to_name, Sim},
 };
 
-const WG_SIZE_XY: u32 = 8;
+const WG_SIZE_XY: u32 = 16;
 const WG_SIZE_SEEDS: u32 = 256;
 //const INVALID_ID: u32 = 0xFFFF_FFFF;
 
@@ -128,6 +128,10 @@ pub struct VoronoiApp {
     ids_b: wgpu::Texture,
     ids_a_view: wgpu::TextureView,
     ids_b_view: wgpu::TextureView,
+    pos_a: wgpu::Texture,
+    pos_b: wgpu::Texture,
+    pos_a_view: wgpu::TextureView,
+    pos_b_view: wgpu::TextureView,
 
     // Color (linear storage + srgb view for egui)
     color_tex: wgpu::Texture,
@@ -152,6 +156,7 @@ pub struct VoronoiApp {
     jfa_bg_a_to_b: wgpu::BindGroup,
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
+    shade_bg_b: wgpu::BindGroup,
 }
 
 impl VoronoiApp {
@@ -278,6 +283,8 @@ impl VoronoiApp {
         // === Textures ===
         let (ids_a, ids_a_view) = Self::make_ids_texture(device, size, Some("ids_a"));
         let (ids_b, ids_b_view) = Self::make_ids_texture(device, size, Some("ids_b"));
+        let (pos_a, pos_a_view) = Self::make_pos_texture(device, size, Some("pos_a"));
+        let (pos_b, pos_b_view) = Self::make_pos_texture(device, size, Some("pos_b"));
         let (color_tex, color_view) = Self::make_color_texture(device, size, Some("color"));
 
         // === Pipelines ===
@@ -333,29 +340,42 @@ impl VoronoiApp {
                     },
                     count: None,
                 },
+                // dst pos
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rg32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
             ],
         });
+
+
 
         let jfa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_jfa"),
             entries: &[
-                // seeds
+                // src ids (read-only sampled as integer texture)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
-                // src ids (read-only sampled as integer texture)
+                // src pos (read-only float texture)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -372,9 +392,20 @@ impl VoronoiApp {
                     },
                     count: None,
                 },
-                // params_jfa
+                // dst pos (write-only)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rg32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // params_jfa
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -385,6 +416,7 @@ impl VoronoiApp {
                 },
             ],
         });
+
 
         let shade_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_shade"),
@@ -408,17 +440,6 @@ impl VoronoiApp {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::Rgba8Unorm,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                // seeds (read-only)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -550,6 +571,10 @@ impl VoronoiApp {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&ids_a_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&pos_a_view),
+                },
             ],
         });
 
@@ -559,11 +584,11 @@ impl VoronoiApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&ids_a_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&ids_a_view),
+                    resource: wgpu::BindingResource::TextureView(&pos_a_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -571,6 +596,10 @@ impl VoronoiApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&pos_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: params_jfa_buf.as_entire_binding(),
                 },
             ],
@@ -582,11 +611,11 @@ impl VoronoiApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&ids_b_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&ids_b_view),
+                    resource: wgpu::BindingResource::TextureView(&pos_b_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -594,26 +623,45 @@ impl VoronoiApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&pos_a_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: params_jfa_buf.as_entire_binding(),
                 },
             ],
         });
 
         let shade_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_shade"),
+            label: Some("bg_shade_a"),
             layout: &shade_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&ids_a_view), // will point to the final ids
+                    resource: wgpu::BindingResource::TextureView(&ids_a_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&color_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: seed_buf.as_entire_binding(),
+                    binding: 3,
+                    resource: color_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let shade_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_shade_b"),
+            layout: &shade_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ids_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&color_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -641,6 +689,10 @@ impl VoronoiApp {
             ids_b,
             ids_a_view,
             ids_b_view,
+            pos_a,
+            pos_b,
+            pos_a_view,
+            pos_b_view,
             color_tex,
             color_view,
             clear_pipeline,
@@ -657,6 +709,7 @@ impl VoronoiApp {
             jfa_bg_a_to_b,
             jfa_bg_b_to_a,
             shade_bg,
+            shade_bg_b,
             prev_frame_time: std::time::Instant::now(),
             presets,
 
@@ -697,6 +750,39 @@ impl VoronoiApp {
         let view = tex.create_view(&wgpu::TextureViewDescriptor {
             label: Some("ids_view"),
             format: Some(wgpu::TextureFormat::R32Uint),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        (tex, view)
+    }
+
+    fn make_pos_texture(
+        device: &wgpu::Device,
+        size: (u32, u32),
+        label: Option<&str>,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label,
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("pos_view"),
+            format: Some(wgpu::TextureFormat::Rg32Float),
             dimension: Some(wgpu::TextureViewDimension::D2),
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0,
@@ -778,6 +864,10 @@ impl VoronoiApp {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.pos_a_view),
+                },
             ],
         });
         self.jfa_bg_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -786,11 +876,11 @@ impl VoronoiApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
+                    resource: wgpu::BindingResource::TextureView(&self.pos_a_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -798,6 +888,10 @@ impl VoronoiApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.pos_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: self.params_jfa_buf.as_entire_binding(),
                 },
             ],
@@ -808,11 +902,11 @@ impl VoronoiApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
+                    resource: wgpu::BindingResource::TextureView(&self.pos_b_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -820,12 +914,16 @@ impl VoronoiApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.pos_a_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: self.params_jfa_buf.as_entire_binding(),
                 },
             ],
         });
         self.shade_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bg_shade"),
+            label: Some("bg_shade_a"),
             layout: &self.shade_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -837,8 +935,22 @@ impl VoronoiApp {
                     resource: wgpu::BindingResource::TextureView(&self.color_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.seed_buf.as_entire_binding(),
+                    binding: 3,
+                    resource: self.color_buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.shade_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bg_shade_b"),
+            layout: &self.shade_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.color_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -853,11 +965,17 @@ impl VoronoiApp {
         // Recreate textures
         let (ids_a, ids_a_view) = Self::make_ids_texture(device, self.size, Some("ids_a"));
         let (ids_b, ids_b_view) = Self::make_ids_texture(device, self.size, Some("ids_b"));
+        let (pos_a, pos_a_view) = Self::make_pos_texture(device, self.size, Some("pos_a"));
+        let (pos_b, pos_b_view) = Self::make_pos_texture(device, self.size, Some("pos_b"));
         let (color_tex, color_view) = Self::make_color_texture(device, self.size, Some("color"));
         self.ids_a = ids_a;
         self.ids_a_view = ids_a_view;
         self.ids_b = ids_b;
         self.ids_b_view = ids_b_view;
+        self.pos_a = pos_a;
+        self.pos_a_view = pos_a_view;
+        self.pos_b = pos_b;
+        self.pos_b_view = pos_b_view;
         self.color_tex = color_tex;
         self.color_view = color_view;
 
@@ -902,14 +1020,14 @@ impl VoronoiApp {
             label: Some("voronoi_jfa_encoder"),
         });
 
-        // 1) Clear both ID textures
-        for bg in [&self.clear_bg_a, &self.clear_bg_b] {
+        // 1) Clear only the A IDs texture (B will be fully overwritten)
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("clear_ids_a"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.clear_pipeline);
-            cpass.set_bind_group(0, bg, &[]);
+            cpass.set_bind_group(0, &self.clear_bg_a, &[]);
             cpass.dispatch_workgroups(
                 self.size.0.div_ceil(WG_SIZE_XY),
                 self.size.1.div_ceil(WG_SIZE_XY),
@@ -949,18 +1067,7 @@ impl VoronoiApp {
                 step,
                 _pad: 0,
             };
-            let staging = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("params_jfa_staging"),
-                contents: bytemuck::bytes_of(&pj),
-                usage: wgpu::BufferUsages::COPY_SRC,
-            });
-            encoder.copy_buffer_to_buffer(
-                &staging,
-                0,
-                &self.params_jfa_buf,
-                0,
-                std::mem::size_of::<ParamsJfa>() as u64,
-            );
+            rs.queue.write_buffer(&self.params_jfa_buf, 0, bytemuck::bytes_of(&pj));
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("jfa_step"),
@@ -1027,43 +1134,17 @@ impl VoronoiApp {
         // Our shade BG was built with ids_a_view at binding 0. If the last write ended in B,
         // we temporarily rebind with B for this dispatch.
         let shade_with_b = flip; // if true, IDs live in B
-        if shade_with_b {
-            let tmp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("bg_shade_tmp_b"),
-                layout: &self.shade_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.color_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.seed_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.color_buf.as_entire_binding(),
-                    },
-                ],
-            });
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("shade"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.shade_pipeline);
-            cpass.set_bind_group(0, &tmp_bg, &[]);
-            cpass.dispatch_workgroups(groups_x, groups_y, 1);
-        } else {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("shade"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.shade_pipeline);
-            cpass.set_bind_group(0, &self.shade_bg, &[]);
+            if shade_with_b {
+                cpass.set_bind_group(0, &self.shade_bg_b, &[]);
+            } else {
+                cpass.set_bind_group(0, &self.shade_bg, &[]);
+            }
             cpass.dispatch_workgroups(groups_x, groups_y, 1);
         }
 
