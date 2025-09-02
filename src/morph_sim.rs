@@ -181,6 +181,7 @@ pub struct Sim {
     elapsed_frames: u32,
     cells: Vec<CellBody>,
     source: PathBuf,
+    grid: Vec<Vec<usize>>, // reusable spatial hash grid
 }
 
 impl Sim {
@@ -189,6 +190,7 @@ impl Sim {
             cells: Vec::new(),
             elapsed_frames: 0,
             source: source_dir,
+            grid: Vec::new(),
         }
     }
 
@@ -211,9 +213,15 @@ impl Sim {
     pub fn update(&mut self, positions: &mut Vec<SeedPos>, sidelen: u32) {
         let grid_size = (self.cells.len() as f32).sqrt();
         let pixel_size = sidelen as f32 / grid_size;
-        //dbg!(grid_size, pixel_size);
-
-        let mut grid = vec![vec![]; self.cells.len()];
+        // Prepare reusable grid storage
+        let total_cells = self.cells.len();
+        if self.grid.len() != total_cells {
+            self.grid = vec![Vec::with_capacity(1); total_cells];
+        }
+        // Clear buckets without freeing capacity
+        for bucket in &mut self.grid {
+            bucket.clear();
+        }
 
         for (i, p) in positions.iter().enumerate() {
             let x = p.xy[0] / pixel_size;
@@ -221,8 +229,7 @@ impl Sim {
 
             let index = (y.floor().clamp(0.0, grid_size - 1.0) * grid_size) as usize
                 + (x.floor().clamp(0.0, grid_size - 1.0) as usize);
-            //
-            grid[index].push(i);
+            self.grid[index].push(i);
         }
 
         for (i, cell) in self.cells.iter_mut().enumerate() {
@@ -253,7 +260,7 @@ impl Sim {
                     let ncol = col + dx - 1;
                     let nrow = row + dy - 1;
                     let nindex = nrow * (grid_size as usize) + ncol;
-                    for other in grid[nindex].iter() {
+                    for other in self.grid[nindex].iter() {
                         if other == &i {
                             continue;
                         }

@@ -4,7 +4,6 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use egui::ahash::AHasher;
 use image::GenericImageView;
 use pathfinding::prelude::Weights;
 use std::sync::mpsc;
@@ -78,7 +77,6 @@ pub enum ProgressMsg {
     Cancelled,
 }
 
-type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
 
 pub fn process<P: AsRef<Path>>(
     source_path: P,
@@ -139,119 +137,10 @@ pub fn process<P: AsRef<Path>>(
         sidelen: target.width() as usize,
         settings,
     };
-    // pathfinding::kuhn_munkres, inlined to allow for progress bar and cancelling
-    let (_total_diff, assignments) = {
-        // We call x the rows and y the columns. (nx, ny) is the size of the matrix.
-        let nx = weights.rows();
-        let ny = weights.columns();
-        assert!(
-            nx <= ny,
-            "number of rows must not be larger than number of columns"
-        );
-        // xy represents matching for x, yz matching for y
-        let mut xy: Vec<Option<usize>> = vec![None; nx];
-        let mut yx: Vec<Option<usize>> = vec![None; ny];
-        // lx is the labelling for x nodes, ly the labelling for y nodes. We start
-        // with an acceptable labelling with the maximum possible values for lx
-        // and 0 for ly.
-        let mut lx: Vec<i64> = (0..nx)
-            .map(|row| (0..ny).map(|col| weights.at(row, col)).max().unwrap())
-            .collect::<Vec<_>>();
-        let mut ly: Vec<i64> = vec![0; ny];
-        // s, augmenting, and slack will be reset every time they are reused. augmenting
-        // contains Some(prev) when the corresponding node belongs to the augmenting path.
-        let mut s = FxIndexSet::<usize>::default();
-        let mut alternating = Vec::with_capacity(ny);
-        let mut slack = vec![0; ny];
-        let mut slackx = Vec::with_capacity(ny);
-        for root in 0..nx {
-            alternating.clear();
-            alternating.resize(ny, None);
-            // Find y such that the path is augmented. This will be set when breaking for the
-            // loop below. Above the loop is some code to initialize the search.
-            let mut y = {
-                s.clear();
-                s.insert(root);
-                // Slack for a vertex y is, initially, the margin between the
-                // sum of the labels of root and y, and the weight between root and y.
-                // As we add x nodes to the alternating path, we update the slack to
-                // represent the smallest margin between one of the x nodes and y.
-                for y in 0..ny {
-                    slack[y] = lx[root] + ly[y] - weights.at(root, y);
-                }
-                slackx.clear();
-                slackx.resize(ny, root);
-                Some(loop {
-                    let mut delta = pathfinding::num_traits::Bounded::max_value();
-                    let mut x = 0;
-                    let mut y = 0;
-                    // Select one of the smallest slack delta and its edge (x, y)
-                    // for y not in the alternating path already.
-                    for yy in 0..ny {
-                        if alternating[yy].is_none() && slack[yy] < delta {
-                            delta = slack[yy];
-                            x = slackx[yy];
-                            y = yy;
-                        }
-                    }
-                    // If some slack has been found, remove it from x nodes in the
-                    // alternating path, and add it to y nodes in the alternating path.
-                    // The slack of y nodes outside the alternating path will be reduced
-                    // by this minimal slack as well.
-                    if delta > 0 {
-                        for &x in &s {
-                            lx[x] = lx[x] - delta;
-                        }
-                        for y in 0..ny {
-                            if alternating[y].is_some() {
-                                ly[y] = ly[y] + delta;
-                            } else {
-                                slack[y] = slack[y] - delta;
-                            }
-                        }
-                    }
-                    // Add (x, y) to the alternating path.
-                    alternating[y] = Some(x);
-                    if yx[y].is_none() {
-                        // We have found an augmenting path.
-                        break y;
-                    }
-                    // This y node had a predecessor, add it to the set of x nodes
-                    // in the augmenting path.
-                    let x = yx[y].unwrap();
-                    s.insert(x);
-                    // Update slack because of the added vertex in s might contain a
-                    // greater slack than with previously inserted x nodes in the augmenting
-                    // path.
-                    for y in 0..ny {
-                        if alternating[y].is_none() {
-                            let alternate_slack = lx[x] + ly[y] - weights.at(x, y);
-                            if slack[y] > alternate_slack {
-                                slack[y] = alternate_slack;
-                                slackx[y] = x;
-                            }
-                        }
-                    }
-                })
-            };
-            // Inverse edges along the augmenting path.
-            while y.is_some() {
-                let x = alternating[y.unwrap()].unwrap();
-                let prec = xy[x];
-                yx[y.unwrap()] = Some(x);
-                xy[x] = y;
-                y = prec;
-            }
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                tx.send(ProgressMsg::Cancelled).unwrap();
-                return Ok(());
-            }
-            tx.send(ProgressMsg::Progress(root as f32 / nx as f32))?;
-        }
-        (
-            lx.into_iter().sum::<i64>() + ly.into_iter().sum::<i64>(),
-            xy.into_iter().map(Option::unwrap).collect::<Vec<_>>(),
-        )
+
+    let assignments = match auction_assign(&weights, &tx, &cancelled) {
+        Ok(a) => a,
+        Err(()) => return Ok(()), // already sent Cancelled
     };
 
     let mut img = image::ImageBuffer::new(target.width(), target.height());
@@ -314,4 +203,112 @@ fn serialize_assignments(assignments: Vec<usize>) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn auction_assign(
+    weights: &ImgDiffWeights,
+    tx: &mpsc::SyncSender<ProgressMsg>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Vec<usize>, ()> {
+    let n = weights.rows();
+    let m = weights.columns();
+    assert_eq!(n, m, "assignment requires square matrix");
+
+    // Window radius for candidate pruning
+    let sidelen = weights.sidelen as i32;
+    let win: i32 = if sidelen <= 64 {
+        6
+    } else if sidelen <= 128 {
+        10
+    } else if sidelen <= 256 {
+        14
+    } else {
+        20
+    };
+
+    // Auction variables
+    let epsilon: i64 = 1; // integer epsilon
+    let mut price = vec![0i64; m];
+    let mut owner: Vec<Option<usize>> = vec![None; m]; // which row owns column j
+    let mut assignment: Vec<Option<usize>> = vec![None; n]; // assignment for row i -> col j
+
+    let mut unassigned: Vec<usize> = (0..n).collect();
+    let mut assigned_count: usize = 0;
+
+    // Helper to compute best and second-best candidate for row i
+    let mut iter_counter: usize = 0;
+    while let Some(i) = unassigned.pop() {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tx.send(ProgressMsg::Cancelled);
+            return Err(());
+        }
+
+        // Extract (x, y) for this row to build a local window
+        let x1 = (i % (weights.sidelen)) as i32;
+        let y1 = (i / (weights.sidelen)) as i32;
+        let xmin = (x1 - win).max(0);
+        let xmax = (x1 + win).min(sidelen - 1);
+        let ymin = (y1 - win).max(0);
+        let ymax = (y1 + win).min(sidelen - 1);
+
+        let mut best_j: usize = 0;
+        let mut best_v: i64 = i64::MIN;
+        let mut second_v: i64 = i64::MIN;
+
+        for yy in ymin..=ymax {
+            let base = (yy as usize) * weights.sidelen;
+            for xx in xmin..=xmax {
+                let j = base + (xx as usize);
+                // Score is benefit minus price (maximization)
+                let v = weights.at(i, j) - price[j];
+                if v > best_v {
+                    second_v = best_v;
+                    best_v = v;
+                    best_j = j;
+                } else if v > second_v {
+                    second_v = v;
+                }
+            }
+        }
+
+        if best_v == i64::MIN {
+            // Fallback: scan entire row to avoid dead-ends (shouldn't happen)
+            for j in 0..m {
+                let v = weights.at(i, j) - price[j];
+                if v > best_v {
+                    second_v = best_v;
+                    best_v = v;
+                    best_j = j;
+                } else if v > second_v {
+                    second_v = v;
+                }
+            }
+        }
+
+        if second_v == i64::MIN {
+            // If there is only one candidate, make a minimal bid
+            second_v = best_v - 1;
+        }
+
+        // Bid and assign
+        let bid = (best_v - second_v) + epsilon;
+        price[best_j] = price[best_j] + bid;
+
+        if let Some(prev_i) = owner[best_j] {
+            // Kick out previous owner
+            assignment[prev_i] = None;
+            unassigned.push(prev_i);
+        } else {
+            assigned_count += 1;
+        }
+        owner[best_j] = Some(i);
+        assignment[i] = Some(best_j);
+
+        iter_counter += 1;
+        if iter_counter % 1024 == 0 || assigned_count % (n.max(1) / 100 + 1) == 0 {
+            let _ = tx.send(ProgressMsg::Progress(assigned_count as f32 / n as f32));
+        }
+    }
+
+    Ok(assignment.into_iter().map(|o| o.unwrap()).collect())
 }
